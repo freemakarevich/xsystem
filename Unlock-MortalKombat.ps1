@@ -93,20 +93,77 @@ function Remove-MKHBlock {
     $start = '# BEGIN MK-HOSTS-MANAGER v1'
     $end = '# END MK-HOSTS-MANAGER v1'
     $inside = $false
-    $found = $false
     $builder = [Text.StringBuilder]::new()
     foreach ($match in [regex]::Matches($Text, '[^\r\n]*(?:\r\n|\r|\n|$)')) {
         if (-not $match.Length) { continue }
-        $line = $match.Value.TrimEnd([char[]]"`r`n")
+        $line = $match.Value.Trim()
         if ($line -eq $start) {
-            if ($inside -or $found) { throw 'Повторный или вложенный блок MK hosts.' }
-            $inside = $true; $found = $true
+            if ($inside) { throw 'Вложенный блок MK hosts.' }
+            $inside = $true
         } elseif ($line -eq $end) {
             if (-not $inside) { throw 'Повреждён блок MK hosts.' }
             $inside = $false
         } elseif (-not $inside) { $null = $builder.Append($match.Value) }
     }
     if ($inside) { throw 'Не найден конец блока MK hosts.' }
+    return $builder.ToString()
+}
+
+function Get-MKHBlockGames {
+    param([AllowEmptyString()][string]$Text)
+    $null = Remove-MKHBlock $Text
+    $catalog = Get-MKHGames
+    $found = @{}
+    $inside = $false
+    foreach ($line in ($Text -split '\r\n|\r|\n')) {
+        if ($line.Trim() -eq '# BEGIN MK-HOSTS-MANAGER v1') { $inside = $true; continue }
+        if ($line.Trim() -eq '# END MK-HOSTS-MANAGER v1') { $inside = $false; continue }
+        if (-not $inside) { continue }
+        foreach ($game in $catalog.Keys) {
+            if ($line.Trim() -eq ('# ' + $game)) { $found[$game] = $true }
+            $names = ($line -split '#', 2)[0].Trim() -split '\s+'
+            foreach ($domain in $catalog[$game]) {
+                if ($names -contains $domain) { $found[$game] = $true }
+            }
+        }
+    }
+    return @($catalog.Keys | Where-Object { $found.ContainsKey($_) })
+}
+
+function Get-MKHMapping {
+    param([AllowEmptyString()][string]$Text)
+    foreach ($line in ($Text -split '\r\n|\r|\n')) {
+        $fields = ($line -split '#', 2)[0].Trim() -split '\s+'
+        $address = $null
+        if ($fields.Count -lt 2 -or -not [Net.IPAddress]::TryParse($fields[0], [ref]$address)) { continue }
+        foreach ($name in $fields[1..($fields.Count - 1)]) {
+            [pscustomobject]@{ IP = $fields[0]; Name = $name; Key = $name.TrimEnd('.').ToLowerInvariant() }
+        }
+    }
+}
+
+function Restore-MKHText {
+    param([AllowEmptyString()][string]$Current, [AllowEmptyString()][string]$Original,
+        [string[]]$Games, [string]$NewLine)
+    $outside = Remove-MKHBlock $Current
+    $baseline = Remove-MKHBlock $Original
+    if (-not $Games.Count) { return $outside }
+    $expected = Remove-MKHBlock (New-MKHText $baseline $Games $NewLine)
+    # An edited managed block does not prevent exact restoration of untouched surroundings.
+    if ($outside -ceq $expected) { return $baseline }
+    $catalog = Get-MKHGames
+    $owned = @{}
+    foreach ($game in $Games) { foreach ($domain in $catalog[$game]) { $owned[$domain] = $true } }
+    $existing = @{}
+    foreach ($mapping in (Get-MKHMapping $outside)) { $existing[$mapping.Key] = $true }
+    $builder = [Text.StringBuilder]::new($outside)
+    foreach ($mapping in (Get-MKHMapping $baseline)) {
+        if (-not $owned.ContainsKey($mapping.Key) -or $existing.ContainsKey($mapping.Key)) { continue }
+        if ($builder.Length -and $builder[$builder.Length - 1] -notin @("`n", "`r")) { $null = $builder.Append($NewLine) }
+        $null = $builder.Append($mapping.IP + ' ' + $mapping.Name + $NewLine)
+        # Do not restore a second stale/conflicting mapping for the same name.
+        $existing[$mapping.Key] = $true
+    }
     return $builder.ToString()
 }
 
@@ -193,6 +250,10 @@ function Invoke-MKHChange {
     $statePath = Join-Path $StateDirectory 'state.json'
     $currentBytes = [IO.File]::ReadAllBytes($HostsPath)
     $currentHash = Get-MKHHash $currentBytes
+    $document = Read-MKHDocument $currentBytes
+    $outside = Remove-MKHBlock $document.Text
+    $blockGames = @(Get-MKHBlockGames $document.Text)
+    $hasBlock = $outside -cne $document.Text
     $state = $null
     if ([IO.File]::Exists($statePath)) {
         Assert-MKHRegularPath $statePath
@@ -207,11 +268,9 @@ function Invoke-MKHChange {
             $state.Active = $state.Pending.Active
             $state.Pending = $null
             Write-MKHState $statePath $state
-        } elseif ($state.Active -and $currentHash -ne $state.LastHash) {
-            throw "hosts изменён вне этого скрипта. Автоматическая перезапись отменена. Исходная копия: $(Join-Path $StateDirectory $state.BackupFile)"
         }
     }
-    if ($Restore -and (-not $state -or -not $state.Active)) {
+    if ($Restore -and (-not $state -or -not $state.Active) -and -not $hasBlock) {
         return [pscustomobject]@{ Changed = $false; Message = 'Нет активных изменений этого скрипта для восстановления.'; Backup = $null }
     }
     if ($state -and $state.Active) {
@@ -220,15 +279,11 @@ function Invoke-MKHChange {
         $originalBytes = [IO.File]::ReadAllBytes($backupPath)
         if ((Get-MKHHash $originalBytes) -ne $state.OriginalHash) { throw 'Исходная резервная копия повреждена. hosts не изменён.' }
     } else {
-        $document = Read-MKHDocument $currentBytes
-        if ($document.Text.Contains('# BEGIN MK-HOSTS-MANAGER') -or $document.Text.Contains('# END MK-HOSTS-MANAGER')) {
-            throw 'В hosts уже есть управляемый блок, но нет его активной резервной копии. Файл не изменён.'
-        }
         $state = [pscustomobject]@{
             Version = 1; HostsPath = $HostsPath
             BackupFile = ('hosts-original-' + [guid]::NewGuid().ToString('N') + '.bak')
             OriginalHash = $currentHash; LastHash = $currentHash
-            Games = @(); Active = $true; Pending = $null
+            Games = @($blockGames); Active = $true; Pending = $null
             CreatedAt = [DateTimeOffset]::Now.ToString('o')
         }
         $backupPath = Join-Path $StateDirectory $state.BackupFile
@@ -236,24 +291,33 @@ function Invoke-MKHChange {
         $originalBytes = $currentBytes
     }
     if ($Restore) {
-        $targetBytes = $originalBytes
+        $originalDocument = Read-MKHDocument $originalBytes
+        $targetText = Restore-MKHText $document.Text $originalDocument.Text @($state.Games) $document.NewLine
+        $targetBytes = ConvertTo-MKHBytes $document $targetText
+        if ($targetText -ceq $originalDocument.Text) { $targetBytes = $originalBytes }
         $targetGames = @()
-        $message = 'Исходный hosts восстановлен побайтно из резервной копии.'
+        $message = 'Блок MK удалён, прежние записи MK восстановлены; посторонние ручные правки сохранены.'
     } else {
         $catalog = Get-MKHGames
         foreach ($game in $Games) { if (-not $catalog.Contains($game)) { throw "Неизвестная игра: $game" } }
         if (-not $Games.Count) { throw 'Не выбрана игра.' }
-        $targetGames = @($catalog.Keys | Where-Object { @($state.Games) -contains $_ -or $Games -contains $_ })
-        $document = Read-MKHDocument $originalBytes
-        # Always rebuild from the first snapshot: repeated selections cannot accumulate edits.
+        $targetGames = @($catalog.Keys | Where-Object { @($state.Games) -contains $_ -or $blockGames -contains $_ -or $Games -contains $_ })
+        # Work on the current file, never erase unrelated edits using an old snapshot.
         $targetText = New-MKHText $document.Text $targetGames $document.NewLine
         $targetBytes = ConvertTo-MKHBytes $document $targetText
         $message = 'Настроены: ' + ($targetGames -join ', ') + '. Перезапусти игру.'
     }
     $targetHash = Get-MKHHash $targetBytes
     if ($targetHash -eq $currentHash) {
-        return [pscustomobject]@{ Changed = $false; Message = ('Уже настроено: ' + ($targetGames -join ', ')); Backup = $backupPath }
+        $state.LastHash = $currentHash
+        $state.Games = @($targetGames)
+        $state.Active = -not $Restore
+        $state.Pending = $null
+        Write-MKHState $statePath $state
+        return [pscustomobject]@{ Changed = $false; Message = $message; Backup = $backupPath }
     }
+    $operationBackup = Join-Path $StateDirectory ('hosts-before-' + [guid]::NewGuid().ToString('N') + '.bak')
+    [IO.File]::WriteAllBytes($operationBackup, $currentBytes)
     # Write-ahead state lets the next run recover after an interrupted atomic replacement.
     $state.Pending = [pscustomobject]@{ Hash = $targetHash; Games = @($targetGames); Active = (-not $Restore) }
     Write-MKHState $statePath $state
@@ -263,7 +327,7 @@ function Invoke-MKHChange {
     $state.Active = -not $Restore
     $state.Pending = $null
     Write-MKHState $statePath $state
-    [pscustomobject]@{ Changed = $true; Message = $message; Backup = $backupPath }
+    [pscustomobject]@{ Changed = $true; Message = $message; Backup = $operationBackup }
 }
 
 function Test-MKHAdministrator {
@@ -323,7 +387,7 @@ function Start-MKHMenu {
     Write-Host '2 — Разблокировать MKX'
     Write-Host '3 — Разблокировать MK11'
     Write-Host '4 — Разблокировать MK1'
-    Write-Host '5 — Вернуть hosts как было перед первым применением'
+    Write-Host '5 — Убрать настройки MK (сохранить остальные записи)'
     Write-Host '0 — Выход'
     do { $choice = (Read-Host 'Выбери пункт (0–5)').Trim() } while ($choice -notmatch '^[0-5]$')
     if ($choice -eq '0') { return }
@@ -333,10 +397,6 @@ function Start-MKHMenu {
         try { $locked = $mutex.WaitOne(0) }
         catch [Threading.AbandonedMutexException] { $locked = $true }
         if (-not $locked) { throw 'Другой экземпляр скрипта уже изменяет hosts.' }
-        if ($choice -eq '5' -and -not [IO.Directory]::Exists($storage)) {
-            Write-Host 'Резервных копий этого скрипта нет; hosts не изменён.'
-            return
-        }
         Initialize-MKHStorage $storage
         $selected = switch ($choice) {
             '1' { @('MKX', 'MK11', 'MK1') }
