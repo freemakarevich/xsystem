@@ -242,6 +242,17 @@ function Write-MKHHosts {
     }
 }
 
+function Find-MKHBackup {
+    param([string]$Directory, [string]$Hash)
+    foreach ($file in (Get-ChildItem -LiteralPath $Directory -File -Filter '*.bak' -ErrorAction Stop)) {
+        if ($file.Name -notmatch '^hosts-(original|before)-[a-f0-9]{32}\.bak$' -or
+            ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }
+        $bytes = [IO.File]::ReadAllBytes($file.FullName)
+        if ((Get-MKHHash $bytes) -eq $Hash) { return $file.FullName }
+    }
+    return $null
+}
+
 function Invoke-MKHChange {
     param([string]$HostsPath, [string]$StateDirectory, [string[]]$Games, [switch]$Restore)
     $HostsPath = [IO.Path]::GetFullPath($HostsPath)
@@ -255,6 +266,9 @@ function Invoke-MKHChange {
     $blockGames = @(Get-MKHBlockGames $document.Text)
     $hasBlock = $outside -cne $document.Text
     $state = $null
+    $notice = ''
+    $historyMissing = $false
+    $priorGames = @()
     if ([IO.File]::Exists($statePath)) {
         Assert-MKHRegularPath $statePath
         $state = [IO.File]::ReadAllText($statePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -274,6 +288,26 @@ function Invoke-MKHChange {
         return [pscustomobject]@{ Changed = $false; Message = 'Нет активных изменений этого скрипта для восстановления.'; Backup = $null }
     }
     if ($state -and $state.Active) {
+        $expectedBackup = Join-Path $StateDirectory $state.BackupFile
+        if (-not (Test-Path -LiteralPath $expectedBackup -ErrorAction Stop)) {
+            $recoveredBackup = Find-MKHBackup $StateDirectory $state.OriginalHash
+            if ($recoveredBackup) {
+                $recoveredName = 'hosts-original-' + [guid]::NewGuid().ToString('N') + '.bak'
+                [IO.File]::Copy($recoveredBackup, (Join-Path $StateDirectory $recoveredName), $false)
+                $state.BackupFile = $recoveredName
+                Write-MKHState $statePath $state
+                $notice = 'Исходная копия найдена среди резервных файлов по SHA256; ссылка на неё восстановлена.'
+            } else {
+                $archivePath = Join-Path $StateDirectory ('state-history-' + [guid]::NewGuid().ToString('N') + '.json')
+                Write-MKHState $archivePath $state
+                $priorGames = @($state.Games)
+                $historyMissing = $true
+                $state = $null
+                $notice = 'Старая исходная копия отсутствует. Сохранена новая копия текущего hosts; посторонние записи будут сохранены.'
+            }
+        }
+    }
+    if ($state -and $state.Active) {
         $backupPath = Join-Path $StateDirectory $state.BackupFile
         Assert-MKHRegularPath $backupPath
         $originalBytes = [IO.File]::ReadAllBytes($backupPath)
@@ -283,7 +317,8 @@ function Invoke-MKHChange {
             Version = 1; HostsPath = $HostsPath
             BackupFile = ('hosts-original-' + [guid]::NewGuid().ToString('N') + '.bak')
             OriginalHash = $currentHash; LastHash = $currentHash
-            Games = @($blockGames); Active = $true; Pending = $null
+            Games = @(($priorGames + $blockGames) | Select-Object -Unique); Active = $true; Pending = $null
+            OriginalBaselineComplete = (-not $historyMissing -and -not $hasBlock)
             CreatedAt = [DateTimeOffset]::Now.ToString('o')
         }
         $backupPath = Join-Path $StateDirectory $state.BackupFile
@@ -297,6 +332,9 @@ function Invoke-MKHChange {
         if ($targetText -ceq $originalDocument.Text) { $targetBytes = $originalBytes }
         $targetGames = @()
         $message = 'Блок MK удалён, прежние записи MK восстановлены; посторонние ручные правки сохранены.'
+        if ($state.PSObject.Properties['OriginalBaselineComplete'] -and -not $state.OriginalBaselineComplete) {
+            $message = 'Блок MK удалён, остальные записи сохранены. Адреса MK, потерянные вместе со старой исходной копией, восстановить нельзя.'
+        }
     } else {
         $catalog = Get-MKHGames
         foreach ($game in $Games) { if (-not $catalog.Contains($game)) { throw "Неизвестная игра: $game" } }
@@ -314,7 +352,7 @@ function Invoke-MKHChange {
         $state.Active = -not $Restore
         $state.Pending = $null
         Write-MKHState $statePath $state
-        return [pscustomobject]@{ Changed = $false; Message = $message; Backup = $backupPath }
+        return [pscustomobject]@{ Changed = $false; Message = $message; Backup = $backupPath; Notice = $notice }
     }
     $operationBackup = Join-Path $StateDirectory ('hosts-before-' + [guid]::NewGuid().ToString('N') + '.bak')
     [IO.File]::WriteAllBytes($operationBackup, $currentBytes)
@@ -327,7 +365,7 @@ function Invoke-MKHChange {
     $state.Active = -not $Restore
     $state.Pending = $null
     Write-MKHState $statePath $state
-    [pscustomobject]@{ Changed = $true; Message = $message; Backup = $operationBackup }
+    [pscustomobject]@{ Changed = $true; Message = $message; Backup = $operationBackup; Notice = $notice }
 }
 
 function Test-MKHAdministrator {
@@ -406,6 +444,7 @@ function Start-MKHMenu {
             '5' { @() }
         }
         $result = Invoke-MKHChange -HostsPath $hostsFile -StateDirectory $storage -Games @($selected) -Restore:($choice -eq '5')
+        if ($result.PSObject.Properties['Notice'] -and $result.Notice) { Write-Warning $result.Notice }
         Write-Host $result.Message -ForegroundColor Green
         if ($result.Backup) { Write-Host ('Резервная копия: ' + $result.Backup) }
         if ($result.Changed) {
