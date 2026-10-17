@@ -146,7 +146,6 @@ function New-MKHText {
         $null = $builder.Append($NewLine)
     }
     $null = $builder.Append('# BEGIN MK-HOSTS-MANAGER v1' + $NewLine)
-    $null = $builder.Append('# Proxy: 216.9.224.250; managed by Unlock-MortalKombat.ps1' + $NewLine)
     foreach ($game in $catalog.Keys) {
         if ($Games -notcontains $game) { continue }
         $null = $builder.Append('# ' + $game + $NewLine)
@@ -319,8 +318,6 @@ function Start-MKHMenu {
     $storage = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'MKHostsManager'
     Write-Host ''
     Write-Host 'Mortal Kombat — настройка hosts' -ForegroundColor Cyan
-    Write-Host 'Сервер: 216.9.224.250. Новые игры добавляются к уже выбранным.'
-    Write-Host 'Это только перенаправление указанных сервисов, не VPN и не обход UDP матча MK1.'
     Write-Host ''
     Write-Host '1 — Разблокировать все: MKX, MK11, MK1'
     Write-Host '2 — Разблокировать MKX'
